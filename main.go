@@ -11,14 +11,39 @@ import (
 )
 
 const (
-	GAME_ENTLY_LOG_FILENAME = "game_ently_log.csv"
-	GAME_SCORE_LOG_FILENAME = "game_score_log.csv"
-	GAME_ENTLY_LOG_HEADER   = "player_id,handle_name"
-	GAME_SCORE_LOG_HEADER   = "create_timestamp,player_id,score"
-	GAME_RANKING_HEADER     = "rank,player_id,handle_name,score"
-	CSV_HEADER_NUM          = 0
-	DISPLAY_RANKING         = 10
+	GAME_ENTLY_LOG_FILENAME string = "game_ently_log.csv"
+	GAME_SCORE_LOG_FILENAME string = "game_score_log.csv"
+	GAME_ENTLY_LOG_HEADER   string = "player_id,handle_name"
+	GAME_SCORE_LOG_HEADER   string = "create_timestamp,player_id,score"
+	GAME_RANKING_HEADER     string = "rank,player_id,handle_name,score"
+	CSV_HEADER_NUM          int    = 0
+	DISPLAY_RANKING         int    = 10
 )
+
+type fileNameError struct {
+	fileName string
+}
+
+func (e *fileNameError) Error() string {
+	return fmt.Sprintf("[Error]: 引数に%sファイルが指定されていません。\n", e.fileName)
+}
+
+type fileNotFoundError struct {
+	fileName string
+}
+
+func (e *fileNotFoundError) Error() string {
+	return fmt.Sprintf("[Error]: %sファイルが見つかりません。\n", e.fileName)
+}
+
+type headerCheckError struct {
+	fileName    string
+	errorHeader string
+}
+
+func (e *headerCheckError) Error() string {
+	return fmt.Sprintf("[Error]: %sファイルのヘッダーが違います。 => %s", e.fileName, e.errorHeader)
+}
 
 type Ranking struct {
 	rank       int
@@ -27,61 +52,71 @@ type Ranking struct {
 	score      int
 }
 
-type StoreScores struct {
-	score       int
+type Store struct {
+	handleName  string
+	scores      []int
+	sumScore    int
+	maxScore    int
 	playerCount int
 }
 
+func max(x int, y int) int {
+	if x < y {
+		return y
+	}
+	return x
+}
+
 // コールバック用関数: プレイヤー情報を保存する
-func storePlayers(row []string, m map[string]string, i int) {
+func storePlayerInfo(row []string, store map[string]*Store, i int) error {
 	if i == CSV_HEADER_NUM {
 		header := strings.Join(row, ",")
 		if header != GAME_ENTLY_LOG_HEADER {
-			fmt.Fprintf(os.Stderr, "[Error]: %sファイルのヘッダーが違います。 => %s \n", GAME_ENTLY_LOG_FILENAME, header)
-			os.Exit(1)
+			return &headerCheckError{GAME_ENTLY_LOG_HEADER, header}
 		}
-		return
+		return nil
 	}
 	playerId := row[0]
 	handleName := row[1]
 
-	m[playerId] = handleName
+	store[playerId] = &Store{handleName: handleName}
+
+	return nil
 }
 
 // コールバック用関数: スコア情報を保存する
-func storeScores(row []string, m map[string]*StoreScores, i int) {
+func storePlayerScore(row []string, store map[string]*Store, i int) error {
 	if i == CSV_HEADER_NUM {
 		header := strings.Join(row, ",")
 		if header != GAME_SCORE_LOG_HEADER {
-			fmt.Fprintf(os.Stderr, "[Error]: %sファイルのヘッダーが違います。 => %s \n", GAME_SCORE_LOG_FILENAME, header)
-			os.Exit(1)
+			return &headerCheckError{GAME_ENTLY_LOG_HEADER, header}
 		}
-		return
+		return nil
 	}
 
 	playerId := row[1]
 	score, err := strconv.Atoi(row[2])
 	if err != nil {
-		panic(err)
+		return err
 	}
 
-	if _, ok := m[playerId]; ok {
-		m[playerId].score += score
-		m[playerId].playerCount++
-	} else {
-		m[playerId] = &StoreScores{score, 1}
+	if _, ok := store[playerId]; ok {
+		store[playerId].scores = append(store[playerId].scores, score)
+		store[playerId].sumScore += score
+		store[playerId].maxScore = max(store[playerId].maxScore, score)
+		store[playerId].playerCount++
 	}
+
+	return nil
 }
 
 // ランキングを作成する
-func makeRanking(players map[string]string, scores map[string]*StoreScores) []Ranking {
+func makeRanking(store map[string]*Store) []Ranking {
 	var ranking []Ranking
 
-	for playerId, store := range scores {
-		if _, ok := players[playerId]; ok {
-			// ランクは初期値0で追加する
-			ranking = append(ranking, Ranking{0, playerId, players[playerId], store.score})
-		}
+	for playerId, store := range store {
+		// ランクは初期値0で追加する
+		ranking = append(ranking, Ranking{0, playerId, store.handleName, store.sumScore})
 	}
 	// スコア順にソートする
 	sort.Slice(ranking, func(i, j int) bool {
@@ -118,13 +153,12 @@ func displayRanking(ranking []Ranking) {
 	}
 }
 
-// CSVファイルを1行ずつ読み込み、コールバック関数を実行する
-// スコア情報のログは数千万行以上に肥大化する可能性があるため、1行ずつ読み込むようにする
-func readCsv[T *StoreScores | string](file string, store map[string]T, cb func([]string, map[string]T, int)) {
+// // CSVファイルを1行ずつ読み込み、コールバック関数を実行する
+// // スコア情報のログは数千万行以上に肥大化する可能性があるため、1行ずつ読み込むようにする
+func readCsv(file string, store map[string]*Store, cb func([]string, map[string]*Store, int) error) error {
 	fp, err := os.Open(file)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Error]: %sファイルが見つかりません。\n", file)
-		panic(err)
+		return &fileNotFoundError{file}
 	}
 	defer fp.Close()
 
@@ -134,41 +168,56 @@ func readCsv[T *StoreScores | string](file string, store map[string]T, cb func([
 		if err == io.EOF {
 			break
 		}
-		cb(row, store, i)
+		if err := cb(row, store, i); err != nil {
+			return err
+		}
 	}
+
+	return nil
 }
 
-func getArgs() (string, string) {
+func verifyArgs() (string, string, error) {
 	args := os.Args
 	if len(args) < 2 {
-		fmt.Fprintf(os.Stderr, "[Error]: 引数に%sファイルが指定されていません。\n", GAME_ENTLY_LOG_FILENAME)
-		os.Exit(1)
+		// エラーの場合、argsは空で返す。
+		return "", "", &fileNameError{GAME_ENTLY_LOG_FILENAME}
 	}
 	if len(args) < 3 {
-		fmt.Fprintf(os.Stderr, "[Error]: 引数に%sファイルが指定されていません。\n", GAME_SCORE_LOG_FILENAME)
-		os.Exit(1)
+		// エラーの場合、argsは空で返す。
+		return "", "", &fileNameError{GAME_SCORE_LOG_FILENAME}
 	}
 
 	gameEntlyLogFile := args[1]
 	gameScoreLogFile := args[2]
 
-	return gameEntlyLogFile, gameScoreLogFile
+	return gameEntlyLogFile, gameScoreLogFile, nil
 }
 
 func run() {
 	// 引数を取得する
-	gameEntlyLogFile, gameScoreLogFile := getArgs()
+	gameEntlyLogFile, gameScoreLogFile, err := verifyArgs()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
-	// プレイヤー情報を保存する
-	players := map[string]string{}
-	readCsv[string](gameEntlyLogFile, players, storePlayers)
+	// プレイヤー&スコア情報を保存するStoreを定義する
+	store := make(map[string]*Store, 10000)
 
-	// スコア情報を保存する
-	scores := make(map[string]*StoreScores)
-	readCsv[*StoreScores](gameScoreLogFile, scores, storeScores)
+	// プレイヤー情報をStoreに保存する
+	if err := readCsv(gameEntlyLogFile, store, storePlayerInfo); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	// スコア情報をStoreに保存する
+	if err := readCsv(gameScoreLogFile, store, storePlayerScore); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	// ランキングを作成する
-	ranking := makeRanking(players, scores)
+	ranking := makeRanking(store)
 
 	// 作成したランキングを表示する
 	displayRanking(ranking)
